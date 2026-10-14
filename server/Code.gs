@@ -7,7 +7,7 @@
 var SHEETS = {
   serials: ['serial', 'name', 'status', 'expiry', 'device', 'folders', 'created', 'lastSeen', 'note', 'maxDevices'],
   folders: ['id', 'name', 'order', 'created'],
-  files:   ['id', 'folderId', 'name', 'visible', 'size', 'added', 'order', 'parts', 'fkey', 'psize', 'pages']
+  files:   ['id', 'folderId', 'name', 'visible', 'size', 'added', 'order', 'parts', 'fkey', 'psize', 'pages', 'cover']
 };
 var OLD_CHUNK = 6 * 1024 * 1024;       // حجم الأجزاء القديمة
 var MAX_FILE = 400 * 1024 * 1024;      // أقصى حجم للملف
@@ -109,7 +109,7 @@ function doPost(e) {
   try {
     var a = req.action, fn = API[a];
     if (!fn) return json_({ ok: false, error: 'إجراء غير معروف' });
-    if (/^admin(Add|Rename|Delete|File|Create|Serial|Password|UploadFinish|MigrateFinish)|^activate$/.test(a)) {
+    if (/^admin(Add|Rename|Delete|File|Create|Serial|Password|UploadFinish|MigrateFinish|SetCover)|^activate$/.test(a)) {
       lock = LockService.getScriptLock(); lock.waitLock(20000);
     }
     return json_(fn(req));
@@ -205,7 +205,7 @@ var API = {
     var ids = folders.map(function (f) { return f.id; });
     var files = rows_('files').filter(function (x) { return isTrue_(x.visible) && ids.indexOf(String(x.folderId)) >= 0; })
       .sort(function (a, b) { return (a.order || 0) - (b.order || 0); })
-      .map(function (x) { return { id: x.id, folderId: String(x.folderId), name: x.name, size: Number(x.size) || 0, added: iso_(x.added), pages: Number(x.pages) || 0 }; });
+      .map(function (x) { return { id: x.id, folderId: String(x.folderId), name: x.name, size: Number(x.size) || 0, added: iso_(x.added), pages: Number(x.pages) || 0, cover: String(x.cover || '') }; });
     return { ok: true, name: s.name, expiry: iso_(s.expiry), devices: devices_(s).length, maxDevices: maxDev_(s), folders: folders, files: files };
   },
 
@@ -215,6 +215,14 @@ var API = {
     var n = (enc || parts.length) ? parts.length : Math.max(1, Math.ceil(size / OLD_CHUNK));
     var dk = hash_(req.serial + '|' + req.device + '|' + req.fileId);
     return { ok: true, mode: enc ? 'enc' : 'legacy', parts: n, psize: psize, size: size, k: enc ? xorHex_(String(f.fkey), dk) : '' };
+  },
+
+  covers: function (req) {          // صور الأغلفة المطلوبة فقط
+    checkUser_(req, false);
+    var want = (req.ids || []).slice(0, 60), out = {};
+    var valid = {}; rows_('files').forEach(function (x) { if (x.cover) valid[String(x.cover)] = 1; });
+    want.forEach(function (id) { if (valid[id]) try { out[id] = DriveApp.getFileById(id).getBlob().getDataAsString(); } catch (e) {} });
+    return { ok: true, covers: out };
   },
 
   getAnn: function (req) {
@@ -246,7 +254,7 @@ var API = {
       folders: rows_('folders').slice().sort(function (a, b) { return (a.order || 0) - (b.order || 0); }).map(function (f) { return { id: String(f.id), name: f.name }; }),
       files: rows_('files').slice().sort(function (a, b) { return (a.order || 0) - (b.order || 0); })
         .map(function (x) { return { id: x.id, folderId: String(x.folderId), name: x.name, visible: isTrue_(x.visible), size: Number(x.size) || 0, added: iso_(x.added),
-                                     enc: !!x.fkey, parts: fileParts_(x).length || Math.max(1, Math.ceil((Number(x.size) || 0) / OLD_CHUNK)) }; })
+                                     enc: !!x.fkey, cover: !!x.cover, parts: fileParts_(x).length || Math.max(1, Math.ceil((Number(x.size) || 0) / OLD_CHUNK)) }; })
     };
   },
 
@@ -319,6 +327,31 @@ var API = {
     update_('files', f._row, { parts: req.parts.join(','), fkey: req.key, psize: OLD_CHUNK });
     trashIds_(old);
     return { ok: true };
+  },
+
+  // قراءة الملف للأدمن (لإنشاء الغلاف من الصفحة الأولى)
+  adminPart: function (req) {
+    checkAdmin_(req);
+    var f = rows_('files').filter(function (x) { return x.id === req.id; })[0];
+    if (!f) throw new Error('الملف غير موجود');
+    var parts = fileParts_(f), part = parseInt(req.part, 10) || 0, size = Number(f.size) || 0, data;
+    var n = (f.fkey || parts.length) ? parts.length : Math.max(1, Math.ceil(size / OLD_CHUNK));
+    if (f.fkey) data = DriveApp.getFileById(parts[part]).getBlob().getDataAsString();
+    else if (parts.length) data = Utilities.base64Encode(DriveApp.getFileById(parts[part]).getBlob().getBytes());
+    else data = Utilities.base64Encode(DriveApp.getFileById(f.id).getBlob().getBytes().slice(part * OLD_CHUNK, (part + 1) * OLD_CHUNK));
+    return { ok: true, parts: n, key: f.fkey ? String(f.fkey) : '', data: data };
+  },
+  adminSetCover: function (req) {
+    checkAdmin_(req);
+    var f = rows_('files').filter(function (x) { return x.id === req.id; })[0];
+    if (!f) throw new Error('الملف غير موجود');
+    var data = String(req.data || '');
+    if (data.indexOf('data:image/') !== 0 || data.length > 400000) throw new Error('صورة الغلاف غير صالحة');
+    if (f.cover) trashIds_([f.cover]);
+    var cf = DriveApp.getFolderById(prop_('ROOT')).createFile(f.id + '.cover', data, 'text/plain');
+    var u = { cover: cf.getId() }; if (req.pages) u.pages = req.pages;
+    update_('files', f._row, u);
+    return { ok: true, cover: cf.getId() };
   },
 
   adminFile: function (req) {   // إظهار/إخفاء/إعادة تسمية/نقل
@@ -395,5 +428,5 @@ var API = {
 };
 
 function trashIds_(ids) { (ids || []).forEach(function (id) { if (id) try { DriveApp.getFileById(id).setTrashed(true); } catch (e) {} }); }
-function trashFile_(f) { var ids = fileParts_(f); trashIds_(ids.length ? ids : [f.id]); }
+function trashFile_(f) { var ids = fileParts_(f); trashIds_(ids.length ? ids : [f.id]); if (f.cover) trashIds_([f.cover]); }
 function annName_(req) { return hash_(String(req.serial).toUpperCase() + '|' + req.fileId) + '.json'; }
