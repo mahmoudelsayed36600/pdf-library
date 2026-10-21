@@ -5,7 +5,7 @@
  */
 
 var SHEETS = {
-  serials: ['serial', 'name', 'status', 'expiry', 'device', 'folders', 'created', 'lastSeen', 'note', 'maxDevices'],
+  serials: ['serial', 'name', 'status', 'expiry', 'device', 'folders', 'created', 'lastSeen', 'note', 'maxDevices', 'present', 'presentMin'],
   folders: ['id', 'name', 'order', 'created'],
   files:   ['id', 'folderId', 'name', 'visible', 'size', 'added', 'order', 'parts', 'fkey', 'psize', 'pages', 'cover']
 };
@@ -134,12 +134,16 @@ function devices_(s) {
   return [{ id: d, label: 'جهاز', at: '' }];          // صيغة قديمة: جهاز واحد
 }
 function maxDev_(s) { return Math.max(1, parseInt(s.maxDevices, 10) || 1); }
+function presMin_(s) { return Math.min(Math.max(parseInt(s.presentMin, 10) || 60, 5), 480); }
 function checkUser_(req, bind) {
   var s = findSerial_(req.serial);
   if (!s) throw new Error('INVALID:السيريال غير صحيح أو تم حذفه');
   if (s.status !== 'active') throw new Error('INVALID:هذا السيريال موقوف. تواصل مع الإدارة');
   if (s.expiry && new Date(s.expiry) < new Date()) throw new Error('INVALID:انتهت صلاحية السيريال. تواصل مع الإدارة للتجديد');
   if (!req.device) throw new Error('معرّف الجهاز مفقود');
+  var minV = parseInt(prop_('MIN_VER'), 10) || 0;
+  if (minV && (parseInt(req.ver, 10) || 0) < minV)
+    throw new Error('INVALID:يوجد إصدار أحدث من البرنامج، ويجب التحديث للمتابعة. حمّل الإصدار الجديد من: ' + (prop_('DL_LINK') || ''));
   var list = devices_(s), mine = list.filter(function (d) { return d.id === req.device; })[0];
   if (!mine) {
     if (!bind) throw new Error('INVALID:هذا الجهاز غير مفعّل على السيريال');
@@ -206,7 +210,7 @@ var API = {
     var files = rows_('files').filter(function (x) { return isTrue_(x.visible) && ids.indexOf(String(x.folderId)) >= 0; })
       .sort(function (a, b) { return (a.order || 0) - (b.order || 0); })
       .map(function (x) { return { id: x.id, folderId: String(x.folderId), name: x.name, size: Number(x.size) || 0, added: iso_(x.added), pages: Number(x.pages) || 0, cover: String(x.cover || '') }; });
-    return { ok: true, name: s.name, expiry: iso_(s.expiry), devices: devices_(s).length, maxDevices: maxDev_(s), folders: folders, files: files };
+    return { ok: true, name: s.name, expiry: iso_(s.expiry), devices: devices_(s).length, maxDevices: maxDev_(s), present: isTrue_(s.present), presentMin: presMin_(s), folders: folders, files: files };
   },
 
   fileInfo: function (req) {
@@ -245,11 +249,11 @@ var API = {
   adminData: function (req) {
     checkAdmin_(req);
     return {
-      ok: true,
+      ok: true, minVer: parseInt(prop_('MIN_VER'), 10) || 0,
       serials: rows_('serials').map(function (s) {
         return { serial: s.serial, name: s.name, status: s.status, expiry: iso_(s.expiry),
                  devices: devices_(s).map(function (d) { return { id: String(d.id).slice(0, 8), label: d.label, at: d.at }; }),
-                 maxDevices: maxDev_(s), folders: String(s.folders || '*'), created: iso_(s.created), lastSeen: iso_(s.lastSeen), note: s.note };
+                 maxDevices: maxDev_(s), present: isTrue_(s.present), presentMin: presMin_(s), folders: String(s.folders || '*'), created: iso_(s.created), lastSeen: iso_(s.lastSeen), note: s.note };
       }),
       folders: rows_('folders').slice().sort(function (a, b) { return (a.order || 0) - (b.order || 0); }).map(function (f) { return { id: String(f.id), name: f.name }; }),
       files: rows_('files').slice().sort(function (a, b) { return (a.order || 0) - (b.order || 0); })
@@ -383,7 +387,8 @@ var API = {
       existing.push(s);
       var name = n > 1 ? (req.name || 'مستخدم') + ' ' + (i + 1) : (req.name || 'مستخدم');
       var o = { serial: s, name: name, status: 'active', expiry: exp, device: '', folders: req.folders || '*', created: new Date(), note: req.note || '',
-                maxDevices: Math.min(Math.max(parseInt(req.maxDevices, 10) || 1, 1), 50) };
+                maxDevices: Math.min(Math.max(parseInt(req.maxDevices, 10) || 1, 1), 50),
+                present: !!req.present, presentMin: Math.min(Math.max(parseInt(req.presentMin, 10) || 60, 5), 480) };
       rows.push(SHEETS.serials.map(function (k) { return o[k] === undefined ? '' : o[k]; }));
       out.push(s);
     }
@@ -400,6 +405,8 @@ var API = {
     if (req.status) u.status = req.status;
     if (req.name !== undefined) u.name = req.name;
     if (req.folders !== undefined) u.folders = req.folders;
+    if (req.present !== undefined) u.present = !!req.present;
+    if (req.presentMin !== undefined) u.presentMin = Math.min(Math.max(parseInt(req.presentMin, 10) || 60, 5), 480);
     if (req.maxDevices !== undefined) u.maxDevices = Math.min(Math.max(parseInt(req.maxDevices, 10) || 1, 1), 50);
     if (req.resetDevice) u.device = '';
     if (req.removeDevice) u.device = JSON.stringify(devices_(s).filter(function (d) { return String(d.id).slice(0, 8) !== req.removeDevice; }));
@@ -417,6 +424,13 @@ var API = {
     var s = findSerial_(req.serial);
     if (!s) throw new Error('السيريال غير موجود');
     delRow_('serials', s._row);
+    return { ok: true };
+  },
+  adminUpdatePolicy: function (req) {
+    checkAdmin_(req);
+    var p = PropertiesService.getScriptProperties();
+    p.setProperty('MIN_VER', String(parseInt(req.min, 10) || 0));
+    if (req.link) p.setProperty('DL_LINK', String(req.link).slice(0, 300));
     return { ok: true };
   },
   adminPassword: function (req) {
