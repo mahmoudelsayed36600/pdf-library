@@ -142,7 +142,8 @@ function checkUser_(req, bind) {
   if (s.expiry && new Date(s.expiry) < new Date()) throw new Error('INVALID:انتهت صلاحية السيريال. تواصل مع الإدارة للتجديد');
   if (!req.device) throw new Error('معرّف الجهاز مفقود');
   var minV = parseInt(prop_('MIN_VER'), 10) || 0;
-  if (minV && (parseInt(req.ver, 10) || 0) < minV)
+  var isWeb = /متصفح/.test(String(req.label || ''));      // المتصفح دائماً آخر إصدار: لا يُجبر على التحديث
+  if (minV && !isWeb && (parseInt(req.ver, 10) || 0) < minV)
     throw new Error('INVALID:يوجد إصدار أحدث من البرنامج، ويجب التحديث للمتابعة. حمّل الإصدار الجديد من: ' + (prop_('DL_LINK') || ''));
   var list = devices_(s), mine = list.filter(function (d) { return d.id === req.device; })[0];
   if (!mine) {
