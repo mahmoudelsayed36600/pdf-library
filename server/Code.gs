@@ -6,7 +6,7 @@
 
 var SHEETS = {
   serials: ['serial', 'name', 'status', 'expiry', 'device', 'folders', 'created', 'lastSeen', 'note', 'maxDevices', 'present', 'presentMin'],
-  folders: ['id', 'name', 'order', 'created'],
+  folders: ['id', 'name', 'order', 'created', 'parent'],
   files:   ['id', 'folderId', 'name', 'visible', 'size', 'added', 'order', 'parts', 'fkey', 'psize', 'pages', 'cover']
 };
 var OLD_CHUNK = 6 * 1024 * 1024;       // حجم الأجزاء القديمة
@@ -109,7 +109,7 @@ function doPost(e) {
   try {
     var a = req.action, fn = API[a];
     if (!fn) return json_({ ok: false, error: 'إجراء غير معروف' });
-    if (/^admin(Add|Rename|Delete|File|Create|Serial|Password|UploadFinish|MigrateFinish|SetCover)|^activate$/.test(a)) {
+    if (/^admin(Add|Rename|Delete|File|Create|Serial|Password|UploadFinish|MigrateFinish|SetCover|Move)|^activate$/.test(a)) {
       lock = LockService.getScriptLock(); lock.waitLock(20000);
     }
     return json_(fn(req));
@@ -158,10 +158,22 @@ function checkUser_(req, bind) {
   }
   return s;
 }
+// الأقسام الفرعية: كل قسم له قسم أب (parent)، والسماح بقسم يشمل كل ما بداخله
+function descendants_(ids) {
+  var kids = {};
+  rows_('folders').forEach(function (f) { var p = String(f.parent || ''); (kids[p] = kids[p] || []).push(String(f.id)); });
+  var out = [], seen = {}, stack = ids.slice();
+  while (stack.length) {
+    var id = String(stack.pop());
+    if (seen[id]) continue; seen[id] = 1; out.push(id);
+    (kids[id] || []).forEach(function (c) { stack.push(c); });
+  }
+  return out;
+}
 function allowedFolders_(s) {
   var f = String(s.folders || '').trim();
   if (f === '*' || f === '') return null;
-  return f.split(',').map(function (x) { return x.trim(); });
+  return descendants_(f.split(',').map(function (x) { return x.trim(); }).filter(String));
 }
 function checkAdmin_(req) {
   if (!req.pass || hash_(req.pass) !== prop_('ADMIN_PASS')) throw new Error('كلمة مرور الأدمن غير صحيحة');
@@ -206,8 +218,9 @@ var API = {
     var allow = allowedFolders_(s);
     var folders = rows_('folders').filter(function (f) { return !allow || allow.indexOf(String(f.id)) >= 0; })
       .sort(function (a, b) { return (a.order || 0) - (b.order || 0); })
-      .map(function (f) { return { id: String(f.id), name: f.name }; });
+      .map(function (f) { return { id: String(f.id), name: f.name, parent: String(f.parent || '') }; });
     var ids = folders.map(function (f) { return f.id; });
+    folders.forEach(function (f) { if (f.parent && ids.indexOf(f.parent) < 0) f.parent = ''; });   // القسم المسموح يظهر كقسم رئيسي
     var files = rows_('files').filter(function (x) { return isTrue_(x.visible) && ids.indexOf(String(x.folderId)) >= 0; })
       .sort(function (a, b) { return (a.order || 0) - (b.order || 0); })
       .map(function (x) { return { id: x.id, folderId: String(x.folderId), name: x.name, size: Number(x.size) || 0, added: iso_(x.added), pages: Number(x.pages) || 0, cover: String(x.cover || '') }; });
@@ -256,7 +269,7 @@ var API = {
                  devices: devices_(s).map(function (d) { return { id: String(d.id).slice(0, 8), label: d.label, at: d.at }; }),
                  maxDevices: maxDev_(s), present: isTrue_(s.present), presentMin: presMin_(s), folders: String(s.folders || '*'), created: iso_(s.created), lastSeen: iso_(s.lastSeen), note: s.note };
       }),
-      folders: rows_('folders').slice().sort(function (a, b) { return (a.order || 0) - (b.order || 0); }).map(function (f) { return { id: String(f.id), name: f.name }; }),
+      folders: rows_('folders').slice().sort(function (a, b) { return (a.order || 0) - (b.order || 0); }).map(function (f) { return { id: String(f.id), name: f.name, parent: String(f.parent || '') }; }),
       files: rows_('files').slice().sort(function (a, b) { return (a.order || 0) - (b.order || 0); })
         .map(function (x) { return { id: x.id, folderId: String(x.folderId), name: x.name, visible: isTrue_(x.visible), size: Number(x.size) || 0, added: iso_(x.added),
                                      enc: !!x.fkey, cover: !!x.cover, parts: fileParts_(x).length || Math.max(1, Math.ceil((Number(x.size) || 0) / OLD_CHUNK)) }; })
@@ -265,8 +278,9 @@ var API = {
 
   adminAddFolder: function (req) {
     checkAdmin_(req);
-    var id = 'F' + Date.now().toString(36);
-    append_('folders', { id: id, name: req.name, order: rows_('folders').length + 1, created: new Date() });
+    var id = 'F' + Date.now().toString(36) + Math.floor(Math.random() * 1296).toString(36), parent = String(req.parent || '');
+    if (parent && !rows_('folders').some(function (x) { return String(x.id) === parent; })) throw new Error('القسم الأب غير موجود');
+    append_('folders', { id: id, name: req.name, order: rows_('folders').length + 1, created: new Date(), parent: parent });
     return { ok: true, id: id };
   },
   adminRenameFolder: function (req) {
@@ -276,14 +290,28 @@ var API = {
     update_('folders', f._row, { name: req.name });
     return { ok: true };
   },
-  adminDeleteFolder: function (req) {
+  adminMoveFolder: function (req) {   // نقل قسم داخل قسم آخر (أو جعله رئيسياً)
     checkAdmin_(req);
-    var files = rows_('files').filter(function (x) { return String(x.folderId) === req.id; });
+    var f = rows_('folders').filter(function (x) { return String(x.id) === req.id; })[0];
+    if (!f) throw new Error('القسم غير موجود');
+    var parent = String(req.parent || '');
+    if (parent) {
+      if (!rows_('folders').some(function (x) { return String(x.id) === parent; })) throw new Error('القسم الأب غير موجود');
+      if (descendants_([req.id]).indexOf(parent) >= 0) throw new Error('لا يمكن نقل القسم داخل نفسه أو داخل قسم من أقسامه الفرعية');
+    }
+    update_('folders', f._row, { parent: parent });
+    return { ok: true };
+  },
+  adminDeleteFolder: function (req) {   // يحذف القسم وكل الأقسام الفرعية والملفات بداخلها
+    checkAdmin_(req);
+    var all = descendants_([req.id]);
+    var files = rows_('files').filter(function (x) { return all.indexOf(String(x.folderId)) >= 0; });
     files.sort(function (a, b) { return b._row - a._row; }).forEach(function (x) { trashFile_(x); sheet_('files').deleteRow(x._row); });
     bump_('files');
-    var f = rows_('folders').filter(function (x) { return String(x.id) === req.id; })[0];
-    if (f) delRow_('folders', f._row);
-    return { ok: true };
+    var fs = rows_('folders').filter(function (x) { return all.indexOf(String(x.id)) >= 0; });
+    fs.sort(function (a, b) { return b._row - a._row; }).forEach(function (x) { sheet_('folders').deleteRow(x._row); });
+    bump_('folders');
+    return { ok: true, deleted: fs.length, files: files.length };
   },
 
   // رفع جزء (مشفّر مسبقاً من المتصفح، يُخزَّن كنص base64)
